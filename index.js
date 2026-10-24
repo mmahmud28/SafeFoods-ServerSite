@@ -1,8 +1,7 @@
-
 require("dotenv").config();
 
 const express = require("express");
-const { MongoClient } = require("mongodb");
+const { MongoClient, ObjectId } = require("mongodb");
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -138,46 +137,211 @@ app.get("/api/users/get-email/:phone", async (req, res) => {
 
 // আপডেট ইউজার
 // Express.js API Route Example
+
 app.patch("/api/users/update-profile", async (req, res) => {
   try {
-    const { userId, email, phone, name, altPhone, address } = req.body;
+    const {
+      userId,
+      email,
+      phone,
+      name,
+      altPhone,
+      address,
+    } = req.body;
 
-    if (!email && !phone && !userId) {
-      return res.status(400).json({ success: false, message: "ইউজারের পরিচয় নিশ্চিত করতে তথ্য প্রয়োজন।" });
+    if (!userId || !ObjectId.isValid(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user ID",
+      });
     }
 
-    const updateData = {};
-    if (name) updateData.name = name.trim();
-    if (email) updateData.email = email.trim().toLowerCase();
-    if (phone) updateData.phone = phone.trim();
-    if (altPhone !== undefined) updateData.altPhone = altPhone.trim();
-    if (address) updateData.address = address.trim();
+    const _id = new ObjectId(userId);
 
-    // আইডি, ইমেইল বা ফোন দিয়ে ইউজার খুঁজে আপডেট করা (যাতে 'ইউজার খুঁজে পাওয়া যায়নি' সমস্যা না হয়)
-    let queryFilter = {};
-    if (userId && userId !== "demo_user_id") {
-      // যদি আপনার প্রজেক্টে ObjectId ব্যবহার করা হয়, তবে ObjectId conversion চেক করে নেবেন
-      queryFilter.$or = [{ _id: userId }, { email: email }, { phone: phone }];
-    } else {
-      queryFilter.$or = [{ email: email }, { phone: phone }];
+    const user = await userCollection.findOne({ _id });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
     }
 
-    const result = await userCollection.updateOne(queryFilter, { $set: updateData });
+    const updateData = {
+      email,
+      phone,
+      name,
+      altPhone,
+      updatedAt: new Date(),
+    };
 
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ success: false, message: "ডাটাবেজে এই অ্যাকাউন্টটি খুঁজে পাওয়া যায়নি।" });
+    const updateQuery = {
+      $set: updateData,
+    };
+
+    // Address changed হলে পুরাতনটি history-তে রাখবে
+    if (
+      typeof address === "string" &&
+      address !== user.address
+    ) {
+      updateData.address = address;
+
+      if (user.address) {
+        updateQuery.$push = {
+          addressHistory: {
+            address: user.address,
+            changedAt: new Date(),
+          },
+        };
+      }
     }
 
-    res.status(200).json({
+    await userCollection.updateOne(
+      { _id },
+      updateQuery
+    );
+
+    const updatedUser = await userCollection.findOne(
+      { _id },
+      {
+        projection: {
+          addressHistory: 0,
+        },
+      }
+    );
+
+    return res.status(200).json({
       success: true,
-      message: "প্রোফাইল তথ্য সফলভাবে আপডেট হয়েছে।",
-      updatedData: updateData,
+      message: "Profile updated successfully",
+      user: updatedUser,
     });
+
   } catch (error) {
-    console.error("Profile Update Error:", error);
-    res.status(500).json({ success: false, message: "প্রোফাইল আপডেট করতে সার্ভারে সমস্যা হয়েছে।" });
+    console.error(error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Profile update failed",
+    });
   }
 });
+
+
+
+// GET - All Categories
+app.get("/api/categories", async (req, res) => {
+  try {
+    const categories = await categoryCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      total: categories.length,
+      categories,
+    });
+  } catch (error) {
+    console.error("Get Categories Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to get categories",
+    });
+  }
+});
+
+// POST - Create Category
+app.post("/api/categories", async (req, res) => {
+  try {
+    const name = req.body?.name;
+
+    if (typeof name !== "string" || !name.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Category name is required",
+      });
+    }
+
+    const cleanName = name.trim();
+
+    // Check duplicate category
+    const existingCategory = await categoryCollection.findOne({
+      name: {
+        $regex: `^${cleanName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+        $options: "i",
+      },
+    });
+
+    if (existingCategory) {
+      return res.status(409).json({
+        success: false,
+        message: "Category already exists",
+      });
+    }
+
+    const category = {
+      name: cleanName,
+      createdAt: new Date(),
+    };
+
+    const result = await categoryCollection.insertOne(category);
+
+    return res.status(201).json({
+      success: true,
+      message: "Category created successfully",
+      category: {
+        ...category,
+        _id: result.insertedId,
+      },
+    });
+  } catch (error) {
+    console.error("Create Category Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to create category",
+    });
+  }
+});
+
+// DELETE - Category
+app.delete("/api/categories/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid category ID",
+      });
+    }
+
+    const result = await categoryCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Category not found",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Category deleted successfully",
+    });
+  } catch (error) {
+    console.error("Delete Category Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to delete category",
+    });
+  }
+});
+
 
 
 // Start Server
