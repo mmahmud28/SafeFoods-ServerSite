@@ -1072,437 +1072,437 @@ async function connectToMongoDB() {
 
 
 
-app.post("/api/orders", async (req, res) => {
-  try {
-    const {
-      draftId,
-      userId,
-      customer,
-      items,
-      deliveryZone,
-      deliveryMethod,
-      paymentMethod
-    } = req.body || {};
+  app.post("/api/orders", async (req, res) => {
+    try {
+      const {
+        draftId,
+        userId,
+        customer,
+        items,
+        deliveryZone,
+        deliveryMethod,
+        paymentMethod
+      } = req.body || {};
 
-    // Customer Validation
-    if (
-      !customer?.name?.trim() ||
-      !customer?.phone?.trim() ||
-      !customer?.district?.trim() ||
-      !customer?.thana?.trim() ||
-      !customer?.address?.trim() ||
-      !Array.isArray(items) ||
-      !items.length
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "সব প্রয়োজনীয় তথ্য পূরণ করুন।"
-      });
-    }
-
-    // USER ID: Frontend first, Phone fallback
-    const receivedUserId = String(userId || "").trim();
-    const phone = String(customer.phone || "").replace(/\D/g, "");
-
-    if (!/^01[3-9]\d{8}$/.test(phone)) {
-      return res.status(400).json({
-        success: false,
-        message: "সঠিক মোবাইল নম্বর দিন।"
-      });
-    }
-
-    const resolvedUserId = receivedUserId || phone;
-
-    console.log("[CONFIRM ORDER] Frontend User ID:", receivedUserId);
-    console.log("[CONFIRM ORDER] Database User ID:", resolvedUserId);
-
-    // Validate Products / Gift Boxes
-    if (
-      items.length > 100 ||
-      items.some(item => {
-        const id = item?.type === "giftBox"
-          ? item.giftBoxId
-          : item?.productId;
-
-        const quantity = Number(item?.quantity);
-
-        return (
-          !ObjectId.isValid(String(id || "")) ||
-          !Number.isInteger(quantity) ||
-          quantity < 1 ||
-          quantity > 99
-        );
-      })
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "পণ্যের তথ্য সঠিক নয়।"
-      });
-    }
-
-    const productIds = items
-      .filter(item => item.type !== "giftBox")
-      .map(item => new ObjectId(String(item.productId)));
-
-    const giftIds = items
-      .filter(item => item.type === "giftBox")
-      .map(item => new ObjectId(String(item.giftBoxId)));
-
-    const [dbProducts, dbGifts] = await Promise.all([
-      productCollection.find({
-        _id: { $in: productIds }
-      }).toArray(),
-
-      giftIds.length
-        ? giftBoxCollection.find({
-            _id: { $in: giftIds }
-          }).toArray()
-        : []
-    ]);
-
-    const productMap = new Map(
-      dbProducts.map(p => [String(p._id), p])
-    );
-
-    const giftMap = new Map(
-      dbGifts.map(g => [String(g._id), g])
-    );
-
-    const now = new Date();
-    const orderItems = [];
-
-    const getPrice = pricing => {
-      const regular = Number(pricing?.regularPrice);
-      const sale = Number(pricing?.salePrice);
-      const start = pricing?.discountStart;
-      const end = pricing?.discountEnd;
-
-      if (!Number.isFinite(regular) || regular < 0) {
-        return NaN;
-      }
-
-      const saleActive =
-        pricing?.salePrice != null &&
-        Number.isFinite(sale) &&
-        sale > 0 &&
-        sale < regular &&
-        (!start ||
-          (Number.isFinite(Date.parse(start)) &&
-            now >= new Date(start))) &&
-        (!end ||
-          (Number.isFinite(Date.parse(end)) &&
-            now <= new Date(end)));
-
-      return saleActive ? sale : regular;
-    };
-
-    for (const item of items) {
-      const quantity = Number(item.quantity);
-
-      // GIFT BOX
-      if (item.type === "giftBox") {
-        const gift = giftMap.get(String(item.giftBoxId));
-
-        if (
-          !gift ||
-          gift.isDeleted === true ||
-          gift.status !== "active"
-        ) {
-          return res.status(400).json({
-            success: false,
-            message: "গিফট বক্সটি বর্তমানে পাওয়া যাচ্ছে না।"
-          });
-        }
-
-        const c = item.customization || {};
-
-        if (
-          !Array.isArray(c.selectedProductIds) ||
-          c.selectedProductIds.length > 100
-        ) {
-          return res.status(400).json({
-            success: false,
-            message: "গিফট বক্সের মিষ্টি নির্বাচন সঠিক নয়।"
-          });
-        }
-
-        const allowedIds = (gift.products || [])
-          .map(p => String(p.productId));
-
-        const selectedIds = [
-          ...new Set(c.selectedProductIds.map(String))
-        ];
-
-        if (
-          !selectedIds.length ||
-          selectedIds.some(id => !allowedIds.includes(id))
-        ) {
-          return res.status(400).json({
-            success: false,
-            message: "গিফট বক্সের নির্বাচিত মিষ্টি সঠিক নয়।"
-          });
-        }
-
-        const box = gift.boxOptions?.find(
-          option => String(option.id) === String(c.boxOptionId)
-        );
-
-        if (gift.boxOptions?.length && !box) {
-          return res.status(400).json({
-            success: false,
-            message: "গিফট বক্স ডিজাইন সঠিক নয়।"
-          });
-        }
-
-        if (
-          (c.greetingCard && !gift.greetingCard?.enabled) ||
-          (c.giftWrapping && !gift.giftWrapping?.enabled)
-        ) {
-          return res.status(400).json({
-            success: false,
-            message: "নির্বাচিত গিফট কাস্টমাইজেশন উপলব্ধ নয়।"
-          });
-        }
-
-        const basePrice = getPrice(gift.pricing);
-        const boxPrice = Number(box?.additionalPrice || 0);
-
-        const greetingPrice = c.greetingCard
-          ? Number(gift.greetingCard?.additionalPrice || 0)
-          : 0;
-
-        const wrappingPrice = c.giftWrapping
-          ? Number(gift.giftWrapping?.additionalPrice || 0)
-          : 0;
-
-        if (
-          [basePrice, boxPrice, greetingPrice, wrappingPrice]
-            .some(v => !Number.isFinite(v) || v < 0)
-        ) {
-          return res.status(400).json({
-            success: false,
-            message: "গিফট বক্সের মূল্য সঠিক নয়।"
-          });
-        }
-
-        const unitPrice =
-          basePrice + boxPrice + greetingPrice + wrappingPrice;
-
-        orderItems.push({
-          type: "giftBox",
-          giftBoxId: String(gift._id),
-          name: gift.name,
-          nameEn: gift.nameEn || "",
-          image: typeof gift.thumbnail === "string"
-            ? gift.thumbnail
-            : gift.thumbnail?.url || "",
-          quantity,
-          price: unitPrice,
-          totalPrice: unitPrice * quantity,
-
-          customization: {
-            selectedProductIds: selectedIds,
-            boxOptionId: String(c.boxOptionId || ""),
-            greetingCard: !!c.greetingCard,
-            giftMessage: c.greetingCard
-              ? String(c.giftMessage || "").slice(
-                  0,
-                  Number(gift.greetingCard?.maxMessageLength) || 200
-                )
-              : "",
-            recipientName: String(
-              c.recipientName || ""
-            ).slice(0, 100),
-            giftWrapping: !!c.giftWrapping
-          }
-        });
-
-        continue;
-      }
-
-      // NORMAL PRODUCT
-      const product = productMap.get(String(item.productId));
-
+      // Customer Validation
       if (
-        !product ||
-        product.isDeleted === true ||
-        ["inactive", "deleted"].includes(product.status) ||
-        product.inStock === false ||
-        (product.stock != null &&
-          Number(product.stock) < quantity)
+        !customer?.name?.trim() ||
+        !customer?.phone?.trim() ||
+        !customer?.district?.trim() ||
+        !customer?.thana?.trim() ||
+        !customer?.address?.trim() ||
+        !Array.isArray(items) ||
+        !items.length
       ) {
         return res.status(400).json({
           success: false,
-          message: "একটি পণ্য অনুপলব্ধ বা পর্যাপ্ত স্টক নেই।"
+          message: "সব প্রয়োজনীয় তথ্য পূরণ করুন।"
         });
       }
 
-      const price = getPrice(product.pricing);
+      // USER ID: Frontend first, Phone fallback
+      const receivedUserId = String(userId || "").trim();
+      const phone = String(customer.phone || "").replace(/\D/g, "");
 
-      if (!Number.isFinite(price) || price < 0) {
+      if (!/^01[3-9]\d{8}$/.test(phone)) {
         return res.status(400).json({
           success: false,
-          message: "পণ্যের মূল্য সঠিক নয়।"
+          message: "সঠিক মোবাইল নম্বর দিন।"
         });
       }
 
-      orderItems.push({
-        productId: String(product._id),
-        name: product.name,
-        nameEn: product.nameEn || "",
-        slug: product.slug || "",
-        image: typeof product.thumbnail === "string"
-          ? product.thumbnail
-          : product.thumbnail?.url || "",
-        quantity,
-        price,
-        totalPrice: price * quantity
-      });
-    }
+      const resolvedUserId = receivedUserId || phone;
 
-    // Delivery Calculation
-    const shippingRates = {
-      inside_faridpur: 50,
-      outside_faridpur: 100
-    };
+      console.log("[CONFIRM ORDER] Frontend User ID:", receivedUserId);
+      console.log("[CONFIRM ORDER] Database User ID:", resolvedUserId);
 
-    if (!Object.hasOwn(shippingRates, deliveryZone)) {
-      return res.status(400).json({
-        success: false,
-        message: "সঠিক ডেলিভারি অপশন নির্বাচন করুন।"
-      });
-    }
+      // Validate Products / Gift Boxes
+      if (
+        items.length > 100 ||
+        items.some(item => {
+          const id = item?.type === "giftBox"
+            ? item.giftBoxId
+            : item?.productId;
 
-    const subtotal = orderItems.reduce(
-      (sum, item) => sum + item.totalPrice,
-      0
-    );
+          const quantity = Number(item?.quantity);
 
-    const totalQuantity = orderItems.reduce(
-      (sum, item) => sum + item.quantity,
-      0
-    );
+          return (
+            !ObjectId.isValid(String(id || "")) ||
+            !Number.isInteger(quantity) ||
+            quantity < 1 ||
+            quantity > 99
+          );
+        })
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "পণ্যের তথ্য সঠিক নয়।"
+        });
+      }
 
-    const deliveryCharge = shippingRates[deliveryZone];
+      const productIds = items
+        .filter(item => item.type !== "giftBox")
+        .map(item => new ObjectId(String(item.productId)));
 
-    const orderNumber =
-      `UL-${Date.now()}-${crypto.randomBytes(3)
-        .toString("hex").toUpperCase()}`;
+      const giftIds = items
+        .filter(item => item.type === "giftBox")
+        .map(item => new ObjectId(String(item.giftBoxId)));
 
-    // Final Order - USER ID INCLUDED
-    const finalOrder = {
-      orderNumber,
-      userId: resolvedUserId,
+      const [dbProducts, dbGifts] = await Promise.all([
+        productCollection.find({
+          _id: { $in: productIds }
+        }).toArray(),
 
-      customer: {
-        name: customer.name.trim(),
-        phone,
-        altPhone: customer.altPhone || "",
-        email: customer.email || "",
-        image: customer.image || "",
-        district: customer.district.trim(),
-        thana: customer.thana.trim(),
-        address: customer.address.trim(),
-        note: customer.note || ""
-      },
+        giftIds.length
+          ? giftBoxCollection.find({
+            _id: { $in: giftIds }
+          }).toArray()
+          : []
+      ]);
 
-      items: orderItems,
-      deliveryZone,
-      deliveryMethod: deliveryMethod || "",
-      deliveryCharge,
-      subtotal,
-      totalQuantity,
-      grandTotal: subtotal + deliveryCharge,
-      paymentMethod: paymentMethod || "Cash on Delivery",
-      paymentStatus: "unpaid",
-      orderStatus: "pending",
-      updatedAt: now
-    };
-
-    let resultId;
-
-    // Convert Draft to Confirmed Order
-    if (draftId && typeof draftId === "string") {
-      const result = await orderCollection.findOneAndUpdate(
-        {
-          draftId,
-          orderStatus: "incomplete"
-        },
-        {
-          $set: finalOrder
-        },
-        {
-          returnDocument: "after"
-        }
+      const productMap = new Map(
+        dbProducts.map(p => [String(p._id), p])
       );
 
-      const updated = result?.value || result;
+      const giftMap = new Map(
+        dbGifts.map(g => [String(g._id), g])
+      );
 
-      if (updated?._id) {
-        resultId = updated._id;
-      }
-    }
+      const now = new Date();
+      const orderItems = [];
 
-    // Insert New Order
-    if (!resultId) {
-      if (draftId) {
-        const existing = await orderCollection.findOne({
-          draftId
-        });
+      const getPrice = pricing => {
+        const regular = Number(pricing?.regularPrice);
+        const sale = Number(pricing?.salePrice);
+        const start = pricing?.discountStart;
+        const end = pricing?.discountEnd;
 
-        if (existing) {
-          return res.status(409).json({
-            success: false,
-            message: "এই Draft ID দিয়ে অর্ডার ইতিমধ্যে নিশ্চিত হয়েছে।"
+        if (!Number.isFinite(regular) || regular < 0) {
+          return NaN;
+        }
+
+        const saleActive =
+          pricing?.salePrice != null &&
+          Number.isFinite(sale) &&
+          sale > 0 &&
+          sale < regular &&
+          (!start ||
+            (Number.isFinite(Date.parse(start)) &&
+              now >= new Date(start))) &&
+          (!end ||
+            (Number.isFinite(Date.parse(end)) &&
+              now <= new Date(end)));
+
+        return saleActive ? sale : regular;
+      };
+
+      for (const item of items) {
+        const quantity = Number(item.quantity);
+
+        // GIFT BOX
+        if (item.type === "giftBox") {
+          const gift = giftMap.get(String(item.giftBoxId));
+
+          if (
+            !gift ||
+            gift.isDeleted === true ||
+            gift.status !== "active"
+          ) {
+            return res.status(400).json({
+              success: false,
+              message: "গিফট বক্সটি বর্তমানে পাওয়া যাচ্ছে না।"
+            });
+          }
+
+          const c = item.customization || {};
+
+          if (
+            !Array.isArray(c.selectedProductIds) ||
+            c.selectedProductIds.length > 100
+          ) {
+            return res.status(400).json({
+              success: false,
+              message: "গিফট বক্সের মিষ্টি নির্বাচন সঠিক নয়।"
+            });
+          }
+
+          const allowedIds = (gift.products || [])
+            .map(p => String(p.productId));
+
+          const selectedIds = [
+            ...new Set(c.selectedProductIds.map(String))
+          ];
+
+          if (
+            !selectedIds.length ||
+            selectedIds.some(id => !allowedIds.includes(id))
+          ) {
+            return res.status(400).json({
+              success: false,
+              message: "গিফট বক্সের নির্বাচিত মিষ্টি সঠিক নয়।"
+            });
+          }
+
+          const box = gift.boxOptions?.find(
+            option => String(option.id) === String(c.boxOptionId)
+          );
+
+          if (gift.boxOptions?.length && !box) {
+            return res.status(400).json({
+              success: false,
+              message: "গিফট বক্স ডিজাইন সঠিক নয়।"
+            });
+          }
+
+          if (
+            (c.greetingCard && !gift.greetingCard?.enabled) ||
+            (c.giftWrapping && !gift.giftWrapping?.enabled)
+          ) {
+            return res.status(400).json({
+              success: false,
+              message: "নির্বাচিত গিফট কাস্টমাইজেশন উপলব্ধ নয়।"
+            });
+          }
+
+          const basePrice = getPrice(gift.pricing);
+          const boxPrice = Number(box?.additionalPrice || 0);
+
+          const greetingPrice = c.greetingCard
+            ? Number(gift.greetingCard?.additionalPrice || 0)
+            : 0;
+
+          const wrappingPrice = c.giftWrapping
+            ? Number(gift.giftWrapping?.additionalPrice || 0)
+            : 0;
+
+          if (
+            [basePrice, boxPrice, greetingPrice, wrappingPrice]
+              .some(v => !Number.isFinite(v) || v < 0)
+          ) {
+            return res.status(400).json({
+              success: false,
+              message: "গিফট বক্সের মূল্য সঠিক নয়।"
+            });
+          }
+
+          const unitPrice =
+            basePrice + boxPrice + greetingPrice + wrappingPrice;
+
+          orderItems.push({
+            type: "giftBox",
+            giftBoxId: String(gift._id),
+            name: gift.name,
+            nameEn: gift.nameEn || "",
+            image: typeof gift.thumbnail === "string"
+              ? gift.thumbnail
+              : gift.thumbnail?.url || "",
+            quantity,
+            price: unitPrice,
+            totalPrice: unitPrice * quantity,
+
+            customization: {
+              selectedProductIds: selectedIds,
+              boxOptionId: String(c.boxOptionId || ""),
+              greetingCard: !!c.greetingCard,
+              giftMessage: c.greetingCard
+                ? String(c.giftMessage || "").slice(
+                  0,
+                  Number(gift.greetingCard?.maxMessageLength) || 200
+                )
+                : "",
+              recipientName: String(
+                c.recipientName || ""
+              ).slice(0, 100),
+              giftWrapping: !!c.giftWrapping
+            }
           });
+
+          continue;
+        }
+
+        // NORMAL PRODUCT
+        const product = productMap.get(String(item.productId));
+
+        if (
+          !product ||
+          product.isDeleted === true ||
+          ["inactive", "deleted"].includes(product.status) ||
+          product.inStock === false ||
+          (product.stock != null &&
+            Number(product.stock) < quantity)
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: "একটি পণ্য অনুপলব্ধ বা পর্যাপ্ত স্টক নেই।"
+          });
+        }
+
+        const price = getPrice(product.pricing);
+
+        if (!Number.isFinite(price) || price < 0) {
+          return res.status(400).json({
+            success: false,
+            message: "পণ্যের মূল্য সঠিক নয়।"
+          });
+        }
+
+        orderItems.push({
+          productId: String(product._id),
+          name: product.name,
+          nameEn: product.nameEn || "",
+          slug: product.slug || "",
+          image: typeof product.thumbnail === "string"
+            ? product.thumbnail
+            : product.thumbnail?.url || "",
+          quantity,
+          price,
+          totalPrice: price * quantity
+        });
+      }
+
+      // Delivery Calculation
+      const shippingRates = {
+        inside_faridpur: 50,
+        outside_faridpur: 100
+      };
+
+      if (!Object.hasOwn(shippingRates, deliveryZone)) {
+        return res.status(400).json({
+          success: false,
+          message: "সঠিক ডেলিভারি অপশন নির্বাচন করুন।"
+        });
+      }
+
+      const subtotal = orderItems.reduce(
+        (sum, item) => sum + item.totalPrice,
+        0
+      );
+
+      const totalQuantity = orderItems.reduce(
+        (sum, item) => sum + item.quantity,
+        0
+      );
+
+      const deliveryCharge = shippingRates[deliveryZone];
+
+      const orderNumber =
+        `UL-${Date.now()}-${crypto.randomBytes(3)
+          .toString("hex").toUpperCase()}`;
+
+      // Final Order - USER ID INCLUDED
+      const finalOrder = {
+        orderNumber,
+        userId: resolvedUserId,
+
+        customer: {
+          name: customer.name.trim(),
+          phone,
+          altPhone: customer.altPhone || "",
+          email: customer.email || "",
+          image: customer.image || "",
+          district: customer.district.trim(),
+          thana: customer.thana.trim(),
+          address: customer.address.trim(),
+          note: customer.note || ""
+        },
+
+        items: orderItems,
+        deliveryZone,
+        deliveryMethod: deliveryMethod || "",
+        deliveryCharge,
+        subtotal,
+        totalQuantity,
+        grandTotal: subtotal + deliveryCharge,
+        paymentMethod: paymentMethod || "Cash on Delivery",
+        paymentStatus: "unpaid",
+        orderStatus: "pending",
+        updatedAt: now
+      };
+
+      let resultId;
+
+      // Convert Draft to Confirmed Order
+      if (draftId && typeof draftId === "string") {
+        const result = await orderCollection.findOneAndUpdate(
+          {
+            draftId,
+            orderStatus: "incomplete"
+          },
+          {
+            $set: finalOrder
+          },
+          {
+            returnDocument: "after"
+          }
+        );
+
+        const updated = result?.value || result;
+
+        if (updated?._id) {
+          resultId = updated._id;
         }
       }
 
-      const result = await orderCollection.insertOne({
-        ...finalOrder,
-        ...(draftId ? { draftId } : {}),
-        createdAt: now
+      // Insert New Order
+      if (!resultId) {
+        if (draftId) {
+          const existing = await orderCollection.findOne({
+            draftId
+          });
+
+          if (existing) {
+            return res.status(409).json({
+              success: false,
+              message: "এই Draft ID দিয়ে অর্ডার ইতিমধ্যে নিশ্চিত হয়েছে।"
+            });
+          }
+        }
+
+        const result = await orderCollection.insertOne({
+          ...finalOrder,
+          ...(draftId ? { draftId } : {}),
+          createdAt: now
+        });
+
+        resultId = result.insertedId;
+      }
+
+      console.log("[ORDER SAVED]", {
+        orderId: String(resultId),
+        orderNumber,
+        userId: resolvedUserId
       });
 
-      resultId = result.insertedId;
-    }
-
-    console.log("[ORDER SAVED]", {
-      orderId: String(resultId),
-      orderNumber,
-      userId: resolvedUserId
-    });
-
-    return res.status(201).json({
-      success: true,
-      message: "অর্ডার সফলভাবে সংরক্ষণ হয়েছে।",
-      orderId: resultId,
-      orderNumber,
-      orderStatus: "pending",
-      userId: resolvedUserId,
-
-      order: {
-        _id: resultId,
-        userId: resolvedUserId,
+      return res.status(201).json({
+        success: true,
+        message: "অর্ডার সফলভাবে সংরক্ষণ হয়েছে।",
+        orderId: resultId,
         orderNumber,
-        grandTotal: finalOrder.grandTotal,
-        orderStatus: "pending"
-      }
-    });
+        orderStatus: "pending",
+        userId: resolvedUserId,
 
-  } catch (error) {
-    console.error("CREATE ORDER ERROR:", error);
+        order: {
+          _id: resultId,
+          userId: resolvedUserId,
+          orderNumber,
+          grandTotal: finalOrder.grandTotal,
+          orderStatus: "pending"
+        }
+      });
 
-    return res.status(
-      error.code === 11000 ? 409 : 500
-    ).json({
-      success: false,
-      message: error.code === 11000
-        ? "অর্ডারটি ইতিমধ্যে সংরক্ষিত হয়েছে।"
-        : "অর্ডার সংরক্ষণ করা যায়নি।"
-    });
-  }
-});
+    } catch (error) {
+      console.error("CREATE ORDER ERROR:", error);
+
+      return res.status(
+        error.code === 11000 ? 409 : 500
+      ).json({
+        success: false,
+        message: error.code === 11000
+          ? "অর্ডারটি ইতিমধ্যে সংরক্ষিত হয়েছে।"
+          : "অর্ডার সংরক্ষণ করা যায়নি।"
+      });
+    }
+  });
 
 
 
@@ -1599,94 +1599,94 @@ app.post("/api/orders", async (req, res) => {
 
 
 
- 
-app.post("/api/orders/incomplete", async (req, res) => {
-  try {
-    const {
-      draftId,
-      userId,
-      customer = {},
-      items = [],
-      deliveryZone = "",
-      deliveryMethod = "",
-      paymentMethod = "Cash on Delivery"
-    } = req.body || {};
 
-    // Draft Validation
-    if (!draftId || typeof draftId !== "string") {
-      return res.status(400).json({
-        success: false,
-        message: "Draft ID required"
+  app.post("/api/orders/incomplete", async (req, res) => {
+    try {
+      const {
+        draftId,
+        userId,
+        customer = {},
+        items = [],
+        deliveryZone = "",
+        deliveryMethod = "",
+        paymentMethod = "Cash on Delivery"
+      } = req.body || {};
+
+      // Draft Validation
+      if (!draftId || typeof draftId !== "string") {
+        return res.status(400).json({
+          success: false,
+          message: "Draft ID required"
+        });
+      }
+
+      if (
+        !customer ||
+        typeof customer !== "object" ||
+        Array.isArray(customer) ||
+        !Array.isArray(items)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid order data"
+        });
+      }
+
+      if (items.length > 100) {
+        return res.status(400).json({
+          success: false,
+          message: "Too many items"
+        });
+      }
+
+      const hasData =
+        Object.values(customer).some(
+          value =>
+            typeof value === "string" &&
+            value.trim()
+        ) ||
+        items.length > 0;
+
+      if (!hasData) {
+        return res.status(400).json({
+          success: false,
+          message: "No data to save"
+        });
+      }
+
+      // USER ID: Frontend first, Phone fallback
+      const receivedUserId = String(userId || "").trim();
+
+      const phone = String(
+        customer.phone || ""
+      ).replace(/\D/g, "");
+
+      const resolvedUserId =
+        receivedUserId ||
+        (/^01[3-9]\d{8}$/.test(phone) ? phone : null);
+
+      console.log("[AUTO SAVE] Frontend User ID:", receivedUserId);
+      console.log("[AUTO SAVE] Database User ID:", resolvedUserId);
+
+      // Prevent modification of confirmed orders
+      const existing = await orderCollection.findOne({
+        draftId
       });
-    }
 
-    if (
-      !customer ||
-      typeof customer !== "object" ||
-      Array.isArray(customer) ||
-      !Array.isArray(items)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid order data"
-      });
-    }
+      if (
+        existing &&
+        existing.orderStatus !== "incomplete"
+      ) {
+        return res.status(409).json({
+          success: false,
+          message: "Order already confirmed"
+        });
+      }
 
-    if (items.length > 100) {
-      return res.status(400).json({
-        success: false,
-        message: "Too many items"
-      });
-    }
-
-    const hasData =
-      Object.values(customer).some(
-        value =>
-          typeof value === "string" &&
-          value.trim()
-      ) ||
-      items.length > 0;
-
-    if (!hasData) {
-      return res.status(400).json({
-        success: false,
-        message: "No data to save"
-      });
-    }
-
-    // USER ID: Frontend first, Phone fallback
-    const receivedUserId = String(userId || "").trim();
-
-    const phone = String(
-      customer.phone || ""
-    ).replace(/\D/g, "");
-
-    const resolvedUserId =
-      receivedUserId ||
-      (/^01[3-9]\d{8}$/.test(phone) ? phone : null);
-
-    console.log("[AUTO SAVE] Frontend User ID:", receivedUserId);
-    console.log("[AUTO SAVE] Database User ID:", resolvedUserId);
-
-    // Prevent modification of confirmed orders
-    const existing = await orderCollection.findOne({
-      draftId
-    });
-
-    if (
-      existing &&
-      existing.orderStatus !== "incomplete"
-    ) {
-      return res.status(409).json({
-        success: false,
-        message: "Order already confirmed"
-      });
-    }
-
-    // Safe Product & Gift Box Items
-    const safeItems = items.map(item => ({
-      ...(item.type === "giftBox"
-        ? {
+      // Safe Product & Gift Box Items
+      const safeItems = items.map(item => ({
+        ...(item.type === "giftBox"
+          ? {
             type: "giftBox",
             giftBoxId: String(item.giftBoxId || ""),
             customization: {
@@ -1710,80 +1710,80 @@ app.post("/api/orders/incomplete", async (req, res) => {
                 !!item.customization?.giftWrapping
             }
           }
-        : {
+          : {
             productId: String(item.productId || "")
           }),
 
-      name: String(item.name || ""),
-      quantity: Math.max(
-        1,
-        Math.min(
-          99,
-          Math.floor(Number(item.quantity) || 1)
+        name: String(item.name || ""),
+        quantity: Math.max(
+          1,
+          Math.min(
+            99,
+            Math.floor(Number(item.quantity) || 1)
+          )
         )
-      )
-    }));
+      }));
 
-    const now = new Date();
+      const now = new Date();
 
-    // Save Draft with User ID
-    const result = await orderCollection.updateOne(
-      {
-        draftId,
-        orderStatus: "incomplete"
-      },
-      {
-        $set: {
-          userId: resolvedUserId,
-          customer,
-          items: safeItems,
-          deliveryZone,
-          deliveryMethod,
-          paymentMethod,
-          paymentStatus: "unpaid",
-          updatedAt: now
-        },
-        $setOnInsert: {
+      // Save Draft with User ID
+      const result = await orderCollection.updateOne(
+        {
           draftId,
-          orderStatus: "incomplete",
-          createdAt: now
+          orderStatus: "incomplete"
+        },
+        {
+          $set: {
+            userId: resolvedUserId,
+            customer,
+            items: safeItems,
+            deliveryZone,
+            deliveryMethod,
+            paymentMethod,
+            paymentStatus: "unpaid",
+            updatedAt: now
+          },
+          $setOnInsert: {
+            draftId,
+            orderStatus: "incomplete",
+            createdAt: now
+          }
+        },
+        {
+          upsert: true
         }
-      },
-      {
-        upsert: true
-      }
-    );
+      );
 
-    console.log("[INCOMPLETE ORDER SAVED]", {
-      draftId,
-      userId: resolvedUserId,
-      matchedCount: result.matchedCount,
-      upsertedCount: result.upsertedCount
-    });
+      console.log("[INCOMPLETE ORDER SAVED]", {
+        draftId,
+        userId: resolvedUserId,
+        matchedCount: result.matchedCount,
+        upsertedCount: result.upsertedCount
+      });
 
-    return res.status(
-      result.upsertedCount ? 201 : 200
-    ).json({
-      success: true,
-      message: "Incomplete order saved",
-      draftId,
-      userId: resolvedUserId,
-      orderStatus: "incomplete"
-    });
+      return res.status(
+        result.upsertedCount ? 201 : 200
+      ).json({
+        success: true,
+        message: "Incomplete order saved",
+        draftId,
+        userId: resolvedUserId,
+        orderStatus: "incomplete"
+      });
 
-  } catch (error) {
-    console.error("Incomplete Order Error:", error);
+    } catch (error) {
+      console.error("Incomplete Order Error:", error);
 
-    return res.status(
-      error.code === 11000 ? 409 : 500
-    ).json({
-      success: false,
-      message: error.code === 11000
-        ? "Draft already exists or is confirmed"
-        : "Incomplete order save failed"
-    });
-  }
-});
+      return res.status(
+        error.code === 11000 ? 409 : 500
+      ).json({
+        success: false,
+        message: error.code === 11000
+          ? "Draft already exists or is confirmed"
+          : "Incomplete order save failed"
+      });
+    }
+  });
 
 
 
@@ -1795,9 +1795,359 @@ app.post("/api/orders/incomplete", async (req, res) => {
 
 
 
+  // cartCollection.createIndex({ ownerKey: 1 }, { unique: true });
+
+  // const validId = (id) => ObjectId.isValid(id);
+
+  // const getOwner = (req) => {
+  //   const userId = req.user?.id || req.user?._id;
+
+  //   if (userId) return `user:${userId}`;
+
+  //   const guestId = req.headers["x-guest-cart-id"];
+
+  //   if (
+  //     typeof guestId !== "string" ||
+  //     !/^[a-f0-9-]{36}$/i.test(guestId)
+  //   ) {
+  //     return null;
+  //   }
+
+  //   return `guest:${guestId}`;
+  // };
+
+  // const productAvailable = (p) =>
+  //   p &&
+  //   p.status === "active" &&
+  //   p.isDeleted !== true &&
+  //   p.inStock !== false &&
+  //   p.stock !== 0;
+
+  // const productPrice = (p) => {
+  //   const regular = Number(p.pricing?.regularPrice) || 0;
+  //   const sale = Number(p.pricing?.salePrice);
+
+  //   return sale > 0 && sale < regular ? sale : regular;
+  // };
+
+  // // GET CART
+  // app.get("/api/cart", async (req, res) => {
+  //   try {
+  //     const ownerKey = getOwner(req);
+
+  //     if (!ownerKey) {
+  //       return res.status(400).json({
+  //         success: false,
+  //         message: "Cart owner missing",
+  //       });
+  //     }
+
+  //     const cart = await cartCollection.findOne({ ownerKey });
+
+  //     const items = await Promise.all(
+  //       (cart?.items || []).map(async (item) => {
+  //         const product = await productCollection.findOne({
+  //           _id: new ObjectId(item.productId),
+  //         });
+
+  //         if (!product) return null;
+
+  //         return {
+  //           productId: item.productId,
+  //           name: product.name,
+  //           slug: product.slug,
+  //           thumbnail: product.thumbnail,
+  //           price: productPrice(product),
+  //           quantity: item.quantity,
+  //           available: productAvailable(product),
+  //           stock: product.stock,
+  //         };
+  //       })
+  //     );
+
+  //     const products = items.filter(Boolean);
+
+  //     const subtotal = products.reduce(
+  //       (total, item) => total + item.price * item.quantity,
+  //       0
+  //     );
+
+  //     res.json({
+  //       success: true,
+  //       cart: {
+  //         items: products,
+  //         totalItems: products.reduce(
+  //           (total, item) => total + item.quantity, 0
+  //         ),
+  //         subtotal,
+  //       },
+  //     });
+  //   } catch (error) {
+  //     res.status(500).json({
+  //       success: false,
+  //       message: error.message,
+  //     });
+  //   }
+  // });
+
+  // // ADD TO CART
+  // app.post("/api/cart/add", async (req, res) => {
+  //   try {
+  //     const ownerKey = getOwner(req);
+  //     const { productId } = req.body;
+  //     const quantity = Number(req.body.quantity ?? 1);
+
+  //     if (!ownerKey) {
+  //       return res.status(400).json({
+  //         success: false,
+  //         message: "Cart owner missing",
+  //       });
+  //     }
+
+  //     if (
+  //       !validId(productId) ||
+  //       !Number.isInteger(quantity) ||
+  //       quantity < 1 ||
+  //       quantity > 99
+  //     ) {
+  //       return res.status(400).json({
+  //         success: false,
+  //         message: "Invalid product or quantity",
+  //       });
+  //     }
+
+  //     const product = await productCollection.findOne({
+  //       _id: new ObjectId(productId),
+  //     });
+
+  //     if (!productAvailable(product)) {
+  //       return res.status(400).json({
+  //         success: false,
+  //         message: "পণ্যটি বর্তমানে পাওয়া যাচ্ছে না",
+  //       });
+  //     }
+
+  //     const cart = await cartCollection.findOne({ ownerKey });
+  //     const items = cart?.items || [];
+
+  //     const existing = items.find(
+  //       (item) => item.productId === productId
+  //     );
+
+  //     const nextQuantity = (existing?.quantity || 0) + quantity;
+
+  //     if (
+  //       nextQuantity > 99 ||
+  //       (Number.isFinite(Number(product.stock)) &&
+  //         product.stock !== null &&
+  //         product.stock !== undefined &&
+  //         nextQuantity > Number(product.stock))
+  //     ) {
+  //       return res.status(400).json({
+  //         success: false,
+  //         message: "পর্যাপ্ত স্টক নেই অথবা সর্বোচ্চ quantity অতিক্রম করেছে",
+  //       });
+  //     }
+
+  //     if (existing) {
+  //       existing.quantity = nextQuantity;
+  //     } else {
+  //       items.push({
+  //         productId,
+  //         quantity,
+  //         addedAt: new Date(),
+  //       });
+  //     }
+
+  //     await cartCollection.updateOne(
+  //       { ownerKey },
+  //       {
+  //         $set: {
+  //           items,
+  //           updatedAt: new Date(),
+  //         },
+  //         $setOnInsert: {
+  //           createdAt: new Date(),
+  //         },
+  //       },
+  //       { upsert: true }
+  //     );
+
+  //     res.json({
+  //       success: true,
+  //       message: "পণ্য কার্টে যোগ হয়েছে",
+  //       totalItems: items.reduce(
+  //         (total, item) => total + item.quantity, 0
+  //       ),
+  //     });
+  //   } catch (error) {
+  //     res.status(500).json({
+  //       success: false,
+  //       message: error.message,
+  //     });
+  //   }
+  // });
+
+  // // UPDATE QUANTITY
+  // app.patch("/api/cart/:productId", async (req, res) => {
+  //   try {
+  //     const ownerKey = getOwner(req);
+  //     const { productId } = req.params;
+  //     const quantity = Number(req.body.quantity);
+
+  //     if (
+  //       !ownerKey ||
+  //       !validId(productId) ||
+  //       !Number.isInteger(quantity) ||
+  //       quantity < 1 ||
+  //       quantity > 99
+  //     ) {
+  //       return res.status(400).json({
+  //         success: false,
+  //         message: "Invalid request",
+  //       });
+  //     }
+
+  //     const product = await productCollection.findOne({
+  //       _id: new ObjectId(productId),
+  //     });
+
+  //     if (!productAvailable(product)) {
+  //       return res.status(400).json({
+  //         success: false,
+  //         message: "পণ্যটি পাওয়া যাচ্ছে না",
+  //       });
+  //     }
+
+  //     if (
+  //       product.stock !== undefined &&
+  //       product.stock !== null &&
+  //       quantity > Number(product.stock)
+  //     ) {
+  //       return res.status(400).json({
+  //         success: false,
+  //         message: "পর্যাপ্ত স্টক নেই",
+  //       });
+  //     }
+
+  //     const result = await cartCollection.updateOne(
+  //       {
+  //         ownerKey,
+  //         "items.productId": productId,
+  //       },
+  //       {
+  //         $set: {
+  //           "items.$.quantity": quantity,
+  //           updatedAt: new Date(),
+  //         },
+  //       }
+  //     );
+
+  //     if (!result.matchedCount) {
+  //       return res.status(404).json({
+  //         success: false,
+  //         message: "কার্টে পণ্য পাওয়া যায়নি",
+  //       });
+  //     }
+
+  //     res.json({
+  //       success: true,
+  //       message: "Quantity আপডেট হয়েছে",
+  //     });
+  //   } catch (error) {
+  //     res.status(500).json({
+  //       success: false,
+  //       message: error.message,
+  //     });
+  //   }
+  // });
+
+  // // REMOVE PRODUCT
+  // app.delete("/api/cart/:productId", async (req, res) => {
+  //   try {
+  //     const ownerKey = getOwner(req);
+  //     const { productId } = req.params;
+
+  //     if (!ownerKey || !validId(productId)) {
+  //       return res.status(400).json({
+  //         success: false,
+  //         message: "Invalid request",
+  //       });
+  //     }
+
+  //     await cartCollection.updateOne(
+  //       { ownerKey },
+  //       {
+  //         $pull: { items: { productId } },
+  //         $set: { updatedAt: new Date() },
+  //       }
+  //     );
+
+  //     res.json({
+  //       success: true,
+  //       message: "পণ্য কার্ট থেকে সরানো হয়েছে",
+  //     });
+  //   } catch (error) {
+  //     res.status(500).json({
+  //       success: false,
+  //       message: error.message,
+  //     });
+  //   }
+  // });
+
+  // // CLEAR CART
+  // app.delete("/api/cart", async (req, res) => {
+  //   try {
+  //     const ownerKey = getOwner(req);
+
+  //     if (!ownerKey) {
+  //       return res.status(400).json({
+  //         success: false,
+  //         message: "Cart owner missing",
+  //       });
+  //     }
+
+  //     await cartCollection.updateOne(
+  //       { ownerKey },
+  //       {
+  //         $set: {
+  //           items: [],
+  //           updatedAt: new Date(),
+  //         },
+  //       }
+  //     );
+
+  //     res.json({
+  //       success: true,
+  //       message: "কার্ট খালি করা হয়েছে",
+  //     });
+  //   } catch (error) {
+  //     res.status(500).json({
+  //       success: false,
+  //       message: error.message,
+  //     });
+  //   }
+  // });
+
+
+
+
+  /* =========================================================
+     CART API — SHOP PRODUCTS + GIFT BOXES
+     MongoDB / Express
+     ========================================================= */
+
+  // Assumes these already exist in your backend:
+  // ObjectId
+  // cartCollection
+  // productCollection
+  // giftBoxCollection
+
   cartCollection.createIndex({ ownerKey: 1 }, { unique: true });
 
-  const validId = (id) => ObjectId.isValid(id);
+  const validId = (id) =>
+    typeof id === "string" &&
+    /^[a-fA-F0-9]{24}$/.test(id);
 
   const getOwner = (req) => {
     const userId = req.user?.id || req.user?._id;
@@ -1824,13 +2174,125 @@ app.post("/api/orders/incomplete", async (req, res) => {
     p.stock !== 0;
 
   const productPrice = (p) => {
-    const regular = Number(p.pricing?.regularPrice) || 0;
-    const sale = Number(p.pricing?.salePrice);
+    const regular = Number(p?.pricing?.regularPrice) || 0;
+    const sale = Number(p?.pricing?.salePrice);
 
     return sale > 0 && sale < regular ? sale : regular;
   };
 
-  // GET CART
+  const giftAvailable = (gift) =>
+    gift &&
+    gift.status === "active" &&
+    gift.isDeleted !== true;
+
+  const giftBasePrice = (gift) => {
+    const regular = Number(gift?.pricing?.regularPrice) || 0;
+    const sale = Number(gift?.pricing?.salePrice);
+
+    return sale > 0 && sale < regular ? sale : regular;
+  };
+
+  const safeQuantity = (value) => {
+    const quantity = Number(value);
+    return Number.isInteger(quantity) &&
+      quantity >= 1 &&
+      quantity <= 99;
+  };
+
+  const safeCustomization = (input = {}) => {
+    const c =
+      input &&
+        typeof input === "object" &&
+        !Array.isArray(input)
+        ? input
+        : {};
+
+    return {
+      selectedProductIds: Array.isArray(c.selectedProductIds)
+        ? [...new Set(
+          c.selectedProductIds.map(String)
+        )].slice(0, 100)
+        : [],
+      boxOptionId: String(c.boxOptionId || ""),
+      greetingCard: Boolean(c.greetingCard),
+      giftMessage: String(c.giftMessage || "").slice(0, 500),
+      recipientName: String(c.recipientName || "").slice(0, 100),
+      giftWrapping: Boolean(c.giftWrapping),
+    };
+  };
+
+  const validateGiftCustomization = (gift, customization) => {
+    const c = safeCustomization(customization);
+
+    const validProductIds = new Set(
+      (gift.products || []).map((p) => String(p.productId))
+    );
+
+    if (
+      !c.selectedProductIds.length ||
+      c.selectedProductIds.some((id) => !validProductIds.has(id))
+    ) {
+      throw new Error("Invalid gift box product selection");
+    }
+
+    const options = gift.boxOptions || [];
+
+    if (
+      options.length &&
+      !options.some((option) =>
+        String(option.id) === c.boxOptionId
+      )
+    ) {
+      throw new Error("Invalid gift box option");
+    }
+
+    if (c.greetingCard && gift.greetingCard?.enabled === false) {
+      throw new Error("Greeting card unavailable");
+    }
+
+    if (c.giftWrapping && gift.giftWrapping?.enabled === false) {
+      throw new Error("Gift wrapping unavailable");
+    }
+
+    return c;
+  };
+
+  const giftUnitPrice = (gift, customization) => {
+    const c = safeCustomization(customization);
+
+    const box = (gift.boxOptions || []).find(
+      (option) => String(option.id) === c.boxOptionId
+    );
+
+    return (
+      giftBasePrice(gift) +
+      (Number(box?.additionalPrice) || 0) +
+      (c.greetingCard
+        ? Number(gift.greetingCard?.additionalPrice) || 0
+        : 0) +
+      (c.giftWrapping
+        ? Number(gift.giftWrapping?.additionalPrice) || 0
+        : 0)
+    );
+  };
+
+  const cartTotalItems = (items = []) =>
+    items.reduce(
+      (total, item) => total + (Number(item.quantity) || 0),
+      0
+    );
+
+  // Each gift box configuration gets its own cart key.
+  const newGiftCartKey = () =>
+    `gift-${new ObjectId().toHexString()}`;
+
+  // IMPORTANT:
+  // Gift routes must be registered BEFORE /api/cart/:productId.
+
+  /* =========================================================
+     GET CART
+     ========================================================= */
+
   app.get("/api/cart", async (req, res) => {
     try {
       const ownerKey = getOwner(req);
@@ -1846,6 +2308,51 @@ app.post("/api/orders/incomplete", async (req, res) => {
 
       const items = await Promise.all(
         (cart?.items || []).map(async (item) => {
+          if (item.type === "giftBox") {
+            if (!validId(item.giftBoxId)) return null;
+
+            const gift = await giftBoxCollection.findOne({
+              _id: new ObjectId(item.giftBoxId),
+            });
+
+            if (!gift) return null;
+
+            const customization = safeCustomization(
+              item.customization
+            );
+
+            let isAvailable = giftAvailable(gift);
+
+            try {
+              validateGiftCustomization(gift, customization);
+            } catch {
+              isAvailable = false;
+            }
+
+            const price = giftUnitPrice(gift, customization);
+
+            return {
+              type: "giftBox",
+              cartKey: item.cartKey,
+              giftBoxId: String(item.giftBoxId),
+              name: gift.name,
+              thumbnail: gift.thumbnail,
+              price,
+              unitPrice: price,
+              quantity: item.quantity,
+              available: isAvailable,
+              customization,
+              giftBox: {
+                _id: String(gift._id),
+                name: gift.name,
+                thumbnail: gift.thumbnail,
+                pricing: gift.pricing,
+              },
+            };
+          }
+
+          if (!validId(item.productId)) return null;
+
           const product = await productCollection.findOne({
             _id: new ObjectId(item.productId),
           });
@@ -1853,7 +2360,8 @@ app.post("/api/orders/incomplete", async (req, res) => {
           if (!product) return null;
 
           return {
-            productId: item.productId,
+            type: "product",
+            productId: String(item.productId),
             name: product.name,
             slug: product.slug,
             thumbnail: product.thumbnail,
@@ -1865,37 +2373,39 @@ app.post("/api/orders/incomplete", async (req, res) => {
         })
       );
 
-      const products = items.filter(Boolean);
+      const validItems = items.filter(Boolean);
 
-      const subtotal = products.reduce(
-        (total, item) => total + item.price * item.quantity,
+      const subtotal = validItems.reduce(
+        (total, item) =>
+          total + item.price * item.quantity,
         0
       );
 
-      res.json({
+      return res.json({
         success: true,
         cart: {
-          items: products,
-          totalItems: products.reduce(
-            (total, item) => total + item.quantity, 0
-          ),
+          items: validItems,
+          totalItems: cartTotalItems(validItems),
           subtotal,
         },
       });
     } catch (error) {
-      res.status(500).json({
+      console.error("GET CART ERROR:", error);
+
+      return res.status(500).json({
         success: false,
         message: error.message,
       });
     }
   });
 
-  // ADD TO CART
+  /* =========================================================
+     ADD TO CART — PRODUCT + GIFT BOX
+     ========================================================= */
+
   app.post("/api/cart/add", async (req, res) => {
     try {
       const ownerKey = getOwner(req);
-      const { productId } = req.body;
-      const quantity = Number(req.body.quantity ?? 1);
 
       if (!ownerKey) {
         return res.status(400).json({
@@ -1904,15 +2414,101 @@ app.post("/api/orders/incomplete", async (req, res) => {
         });
       }
 
-      if (
-        !validId(productId) ||
-        !Number.isInteger(quantity) ||
-        quantity < 1 ||
-        quantity > 99
-      ) {
+      const {
+        type = "product",
+        productId,
+        giftBoxId,
+        customization,
+      } = req.body || {};
+
+      const quantity = Number(req.body?.quantity ?? 1);
+
+      if (!safeQuantity(quantity)) {
         return res.status(400).json({
           success: false,
-          message: "Invalid product or quantity",
+          message: "Invalid quantity",
+        });
+      }
+
+      const cart = await cartCollection.findOne({ ownerKey });
+      const items = Array.isArray(cart?.items)
+        ? [...cart.items]
+        : [];
+
+      // ---------------- GIFT BOX ----------------
+
+      if (type === "giftBox") {
+        if (!validId(giftBoxId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid gift box ID",
+          });
+        }
+
+        const gift = await giftBoxCollection.findOne({
+          _id: new ObjectId(giftBoxId),
+        });
+
+        if (!giftAvailable(gift)) {
+          return res.status(400).json({
+            success: false,
+            message: "গিফট বক্সটি বর্তমানে পাওয়া যাচ্ছে না",
+          });
+        }
+
+        let safeCustom;
+
+        try {
+          safeCustom = validateGiftCustomization(
+            gift,
+            customization
+          );
+        } catch (error) {
+          return res.status(400).json({
+            success: false,
+            message: error.message,
+          });
+        }
+
+        const cartKey = newGiftCartKey();
+
+        items.push({
+          type: "giftBox",
+          cartKey,
+          giftBoxId: String(giftBoxId),
+          quantity,
+          customization: safeCustom,
+          addedAt: new Date(),
+        });
+
+        await cartCollection.updateOne(
+          { ownerKey },
+          {
+            $set: {
+              items,
+              updatedAt: new Date(),
+            },
+            $setOnInsert: {
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true }
+        );
+
+        return res.json({
+          success: true,
+          message: "গিফট বক্স কার্টে যোগ হয়েছে",
+          cartKey,
+          totalItems: cartTotalItems(items),
+        });
+      }
+
+      // ---------------- SHOP PRODUCT ----------------
+
+      if (!validId(productId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid product ID",
         });
       }
 
@@ -1927,25 +2523,28 @@ app.post("/api/orders/incomplete", async (req, res) => {
         });
       }
 
-      const cart = await cartCollection.findOne({ ownerKey });
-      const items = cart?.items || [];
-
       const existing = items.find(
-        (item) => item.productId === productId
+        (item) =>
+          item.type !== "giftBox" &&
+          String(item.productId) === String(productId)
       );
 
-      const nextQuantity = (existing?.quantity || 0) + quantity;
+      const nextQuantity =
+        (Number(existing?.quantity) || 0) + quantity;
 
       if (
         nextQuantity > 99 ||
-        (Number.isFinite(Number(product.stock)) &&
+        (
           product.stock !== null &&
           product.stock !== undefined &&
-          nextQuantity > Number(product.stock))
+          Number.isFinite(Number(product.stock)) &&
+          nextQuantity > Number(product.stock)
+        )
       ) {
         return res.status(400).json({
           success: false,
-          message: "পর্যাপ্ত স্টক নেই অথবা সর্বোচ্চ quantity অতিক্রম করেছে",
+          message:
+            "পর্যাপ্ত স্টক নেই অথবা সর্বোচ্চ quantity অতিক্রম করেছে",
         });
       }
 
@@ -1953,7 +2552,8 @@ app.post("/api/orders/incomplete", async (req, res) => {
         existing.quantity = nextQuantity;
       } else {
         items.push({
-          productId,
+          type: "product",
+          productId: String(productId),
           quantity,
           addedAt: new Date(),
         });
@@ -1973,34 +2573,172 @@ app.post("/api/orders/incomplete", async (req, res) => {
         { upsert: true }
       );
 
-      res.json({
+      return res.json({
         success: true,
         message: "পণ্য কার্টে যোগ হয়েছে",
-        totalItems: items.reduce(
-          (total, item) => total + item.quantity, 0
-        ),
+        totalItems: cartTotalItems(items),
       });
     } catch (error) {
-      res.status(500).json({
+      console.error("ADD CART ERROR:", error);
+
+      return res.status(error.code === 11000 ? 409 : 500).json({
         success: false,
         message: error.message,
       });
     }
   });
 
-  // UPDATE QUANTITY
+  /* =========================================================
+     UPDATE GIFT BOX QUANTITY
+     ========================================================= */
+
+  app.patch("/api/cart/gift-box/:cartKey", async (req, res) => {
+    try {
+      const ownerKey = getOwner(req);
+      const cartKey = String(req.params.cartKey || "");
+      const quantity = Number(req.body?.quantity);
+
+      if (
+        !ownerKey ||
+        !cartKey.startsWith("gift-") ||
+        !safeQuantity(quantity)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid request",
+        });
+      }
+
+      const cart = await cartCollection.findOne({ ownerKey });
+
+      const item = cart?.items?.find(
+        (x) =>
+          x.type === "giftBox" &&
+          x.cartKey === cartKey
+      );
+
+      if (!item) {
+        return res.status(404).json({
+          success: false,
+          message: "গিফট বক্স কার্টে পাওয়া যায়নি",
+        });
+      }
+
+      const gift = validId(item.giftBoxId)
+        ? await giftBoxCollection.findOne({
+          _id: new ObjectId(item.giftBoxId),
+        })
+        : null;
+
+      if (!giftAvailable(gift)) {
+        return res.status(400).json({
+          success: false,
+          message: "গিফট বক্সটি পাওয়া যাচ্ছে না",
+        });
+      }
+
+      try {
+        validateGiftCustomization(gift, item.customization);
+      } catch (error) {
+        return res.status(400).json({
+          success: false,
+          message: error.message,
+        });
+      }
+
+      const result = await cartCollection.updateOne(
+        {
+          ownerKey,
+          "items.cartKey": cartKey,
+        },
+        {
+          $set: {
+            "items.$.quantity": quantity,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (!result.matchedCount) {
+        return res.status(404).json({
+          success: false,
+          message: "গিফট বক্স কার্টে পাওয়া যায়নি",
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: "Gift Box quantity আপডেট হয়েছে",
+      });
+    } catch (error) {
+      console.error("UPDATE GIFT CART ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message,
+      });
+    }
+  });
+
+  /* =========================================================
+     REMOVE GIFT BOX
+     ========================================================= */
+
+  app.delete("/api/cart/gift-box/:cartKey", async (req, res) => {
+    try {
+      const ownerKey = getOwner(req);
+      const cartKey = String(req.params.cartKey || "");
+
+      if (!ownerKey || !cartKey.startsWith("gift-")) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid request",
+        });
+      }
+
+      await cartCollection.updateOne(
+        { ownerKey },
+        {
+          $pull: {
+            items: {
+              type: "giftBox",
+              cartKey,
+            },
+          },
+          $set: {
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      return res.json({
+        success: true,
+        message: "গিফট বক্স কার্ট থেকে সরানো হয়েছে",
+      });
+    } catch (error) {
+      console.error("REMOVE GIFT CART ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: error.message,
+      });
+    }
+  });
+
+  /* =========================================================
+     UPDATE SHOP PRODUCT QUANTITY
+     ========================================================= */
+
   app.patch("/api/cart/:productId", async (req, res) => {
     try {
       const ownerKey = getOwner(req);
       const { productId } = req.params;
-      const quantity = Number(req.body.quantity);
+      const quantity = Number(req.body?.quantity);
 
       if (
         !ownerKey ||
         !validId(productId) ||
-        !Number.isInteger(quantity) ||
-        quantity < 1 ||
-        quantity > 99
+        !safeQuantity(quantity)
       ) {
         return res.status(400).json({
           success: false,
@@ -2033,7 +2771,7 @@ app.post("/api/orders/incomplete", async (req, res) => {
       const result = await cartCollection.updateOne(
         {
           ownerKey,
-          "items.productId": productId,
+          "items.productId": String(productId),
         },
         {
           $set: {
@@ -2050,19 +2788,24 @@ app.post("/api/orders/incomplete", async (req, res) => {
         });
       }
 
-      res.json({
+      return res.json({
         success: true,
         message: "Quantity আপডেট হয়েছে",
       });
     } catch (error) {
-      res.status(500).json({
+      console.error("UPDATE PRODUCT CART ERROR:", error);
+
+      return res.status(500).json({
         success: false,
         message: error.message,
       });
     }
   });
 
-  // REMOVE PRODUCT
+  /* =========================================================
+     REMOVE SHOP PRODUCT
+     ========================================================= */
+
   app.delete("/api/cart/:productId", async (req, res) => {
     try {
       const ownerKey = getOwner(req);
@@ -2078,24 +2821,35 @@ app.post("/api/orders/incomplete", async (req, res) => {
       await cartCollection.updateOne(
         { ownerKey },
         {
-          $pull: { items: { productId } },
-          $set: { updatedAt: new Date() },
+          $pull: {
+            items: {
+              productId: String(productId),
+            },
+          },
+          $set: {
+            updatedAt: new Date(),
+          },
         }
       );
 
-      res.json({
+      return res.json({
         success: true,
         message: "পণ্য কার্ট থেকে সরানো হয়েছে",
       });
     } catch (error) {
-      res.status(500).json({
+      console.error("REMOVE PRODUCT CART ERROR:", error);
+
+      return res.status(500).json({
         success: false,
         message: error.message,
       });
     }
   });
 
-  // CLEAR CART
+  /* =========================================================
+     CLEAR CART — PRODUCT + GIFT BOX
+     ========================================================= */
+
   app.delete("/api/cart", async (req, res) => {
     try {
       const ownerKey = getOwner(req);
@@ -2117,20 +2871,19 @@ app.post("/api/orders/incomplete", async (req, res) => {
         }
       );
 
-      res.json({
+      return res.json({
         success: true,
         message: "কার্ট খালি করা হয়েছে",
       });
     } catch (error) {
-      res.status(500).json({
+      console.error("CLEAR CART ERROR:", error);
+
+      return res.status(500).json({
         success: false,
         message: error.message,
       });
     }
   });
-
-
-
 
 
 
